@@ -43,15 +43,14 @@ pip install -e .
 set -a && source ../.env && set +a
 export STORAGE_PATH=../storage
 
-# Terminal 1 — API
+# Terminal 1 — API (ETL runs in-process by default; no Celery needed)
 uvicorn app.main:app --reload --port 8000
 
-# Terminal 2 — Celery worker (required for async uploads)
-celery -A app.tasks.celery_app worker --loglevel=info
-
-# Terminal 3 — Streamlit UI (optional)
+# Terminal 2 — Streamlit UI (optional)
 streamlit run streamlit_app/app.py
 ```
+
+Set `USE_CELERY=true` in `.env` only if you want a separate Celery worker (Docker Compose sets this up automatically).
 
 ## Phase 0 lab (minimal, no UI)
 

@@ -1,99 +1,134 @@
 from __future__ import annotations
 
+import logging
 import uuid
-from pathlib import Path
 
 from celery import Celery
 
 from app.config import get_settings
 from app.database import session_scope
-from app.models import AgentRun, AgentRunStatus, IngestionJob, JobStatus, TasteProfile
+from app.models import AgentRun, AgentRunStatus, IngestionJob, JobStatus
 
+logger = logging.getLogger(__name__)
 settings = get_settings()
 
 celery_app = Celery("content_creator", broker=settings.redis_url, backend=settings.redis_url)
 celery_app.conf.update(task_serializer="json", result_serializer="json", accept_content=["json"])
 
 
-@celery_app.task(name="run_etl_job")
+def _mark_job_failed(job_id: str, thread_id: str | None, error: str) -> None:
+    with session_scope() as db:
+        job = db.get(IngestionJob, job_id)
+        if job:
+            job.status = JobStatus.FAILED
+            job.error_message = error
+        if thread_id:
+            agent_run = (
+                db.query(AgentRun)
+                .filter(AgentRun.thread_id == thread_id)
+                .order_by(AgentRun.created_at.desc())
+                .first()
+            )
+            if agent_run:
+                agent_run.status = AgentRunStatus.FAILED
+                agent_run.logs = (agent_run.logs or []) + [f"Pipeline failed: {error}"]
+
+
 def run_etl_job(job_id: str, simulate_failure: bool = False) -> dict:
     from app.agents.graph import run_etl_pipeline
 
-    with session_scope() as db:
-        job = db.get(IngestionJob, job_id)
-        if job is None:
-            raise ValueError(f"Job not found: {job_id}")
-        if not job.source_path:
-            raise ValueError("Job has no source_path")
+    thread_id: str | None = None
+    try:
+        with session_scope() as db:
+            job = db.get(IngestionJob, job_id)
+            if job is None:
+                raise ValueError(f"Job not found: {job_id}")
+            if not job.source_path:
+                raise ValueError("Job has no source_path")
 
-        thread_id = str(uuid.uuid4())
-        agent_run = AgentRun(
-            job_id=job.id,
+            thread_id = str(uuid.uuid4())
+            agent_run = AgentRun(
+                job_id=job.id,
+                thread_id=thread_id,
+                status=AgentRunStatus.RUNNING,
+                current_step="starting",
+                logs=["ETL pipeline started"],
+            )
+            job.status = JobStatus.RUNNING
+            db.add(agent_run)
+            db.commit()
+
+            source_path = job.source_path
+            source_type: str = "data_export" if source_path.endswith(".zip") else "sample_json"
+
+        final_state = run_etl_pipeline(
+            job_id=job_id,
+            source_path=source_path,
+            source_type=source_type,  # type: ignore[arg-type]
             thread_id=thread_id,
-            status=AgentRunStatus.RUNNING,
-            current_step="starting",
-            logs=["ETL pipeline started"],
+            simulate_failure=simulate_failure,
         )
-        job.status = JobStatus.RUNNING
-        db.add(agent_run)
-        db.commit()
 
-        source_path = job.source_path
-        source_type: str = "data_export" if source_path.endswith(".zip") else "sample_json"
+        with session_scope() as db:
+            job = db.get(IngestionJob, job_id)
+            agent_run = (
+                db.query(AgentRun).filter(AgentRun.thread_id == thread_id).order_by(AgentRun.created_at.desc()).first()
+            )
+            if job is None or agent_run is None:
+                return {"status": "failed", "reason": "missing job or agent run"}
 
-    final_state = run_etl_pipeline(
-        job_id=job_id,
-        source_path=source_path,
-        source_type=source_type,  # type: ignore[arg-type]
-        thread_id=thread_id,
-        simulate_failure=simulate_failure,
-    )
+            if final_state.get("last_error") and final_state.get("retry_count", 0) >= final_state.get("max_retries", 3):
+                job.status = JobStatus.FAILED
+                job.error_message = final_state.get("last_error")
+                agent_run.status = AgentRunStatus.FAILED
+            elif final_state.get("human_approval") is None:
+                job.status = JobStatus.AWAITING_APPROVAL
+                agent_run.status = AgentRunStatus.AWAITING_APPROVAL
+            else:
+                job.status = JobStatus.COMPLETED
+                agent_run.status = AgentRunStatus.COMPLETED
 
-    with session_scope() as db:
-        job = db.get(IngestionJob, job_id)
-        agent_run = (
-            db.query(AgentRun).filter(AgentRun.thread_id == thread_id).order_by(AgentRun.created_at.desc()).first()
-        )
-        if job is None or agent_run is None:
-            return {"status": "failed", "reason": "missing job or agent run"}
+            agent_run.state_snapshot = {
+                "bronze_count": final_state.get("bronze_count"),
+                "silver_count": final_state.get("silver_count"),
+                "gold_profile_id": final_state.get("gold_profile_id"),
+                "quality_score": final_state.get("quality_score"),
+                "logs": final_state.get("logs", []),
+            }
+            agent_run.current_step = final_state.get("current_step")
+            final_status = job.status.value
 
-        if final_state.get("last_error") and final_state.get("retry_count", 0) >= final_state.get("max_retries", 3):
-            job.status = JobStatus.FAILED
-            job.error_message = final_state.get("last_error")
-            agent_run.status = AgentRunStatus.FAILED
-        elif final_state.get("human_approval") is None:
-            job.status = JobStatus.AWAITING_APPROVAL
-            agent_run.status = AgentRunStatus.AWAITING_APPROVAL
-        else:
-            job.status = JobStatus.COMPLETED
-            agent_run.status = AgentRunStatus.COMPLETED
-
-        agent_run.state_snapshot = {
+        return {
+            "job_id": job_id,
+            "thread_id": thread_id,
+            "status": final_status,
             "bronze_count": final_state.get("bronze_count"),
             "silver_count": final_state.get("silver_count"),
             "gold_profile_id": final_state.get("gold_profile_id"),
             "quality_score": final_state.get("quality_score"),
             "logs": final_state.get("logs", []),
         }
-        agent_run.current_step = final_state.get("current_step")
-        final_status = job.status.value
+    except Exception as exc:
+        logger.exception("ETL job %s failed", job_id)
+        _mark_job_failed(job_id, thread_id, str(exc))
+        raise
 
-    return {
-        "job_id": job_id,
-        "thread_id": thread_id,
-        "status": final_status,
-        "bronze_count": final_state.get("bronze_count"),
-        "silver_count": final_state.get("silver_count"),
-        "gold_profile_id": final_state.get("gold_profile_id"),
-        "quality_score": final_state.get("quality_score"),
-        "logs": final_state.get("logs", []),
-    }
+
+def dispatch_etl_job(job_id: str, simulate_failure: bool = False) -> None:
+    """Run ETL via Celery queue or inline (default for local dev)."""
+    if settings.use_celery:
+        run_etl_job_task.delay(job_id, simulate_failure=simulate_failure)
+    else:
+        run_etl_job(job_id, simulate_failure=simulate_failure)
+
+
+@celery_app.task(name="run_etl_job")
+def run_etl_job_task(job_id: str, simulate_failure: bool = False) -> dict:
+    return run_etl_job(job_id, simulate_failure=simulate_failure)
 
 
 @celery_app.task(name="approve_etl_job")
 def approve_etl_job(job_id: str, approved: bool) -> dict:
-    from app.agents.graph import run_etl_pipeline
-
     with session_scope() as db:
         job = db.get(IngestionJob, job_id)
         if job is None:

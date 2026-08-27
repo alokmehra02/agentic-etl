@@ -4,14 +4,14 @@ import shutil
 import uuid
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.database import get_db
 from app.models import AgentRun, IngestionJob, IngestionSource, JobStatus, TasteProfile
 from app.schemas.jobs import ApprovalRequest, IngestionJobResponse, JobDetailResponse, TasteProfileResponse
-from app.tasks.celery_app import approve_etl_job, run_etl_job
+from app.tasks.celery_app import approve_etl_job, dispatch_etl_job
 
 router = APIRouter(prefix="/ingest", tags=["ingest"])
 settings = get_settings()
@@ -25,6 +25,7 @@ def _ensure_storage() -> Path:
 
 @router.post("/export", response_model=IngestionJobResponse)
 async def upload_export(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     simulate_failure: bool = False,
     db: Session = Depends(get_db),
@@ -54,8 +55,18 @@ async def upload_export(
     db.commit()
     db.refresh(job)
 
-    run_etl_job.delay(str(job.id), simulate_failure=simulate_failure)
+    if settings.use_celery:
+        dispatch_etl_job(str(job.id), simulate_failure=simulate_failure)
+    else:
+        background_tasks.add_task(run_etl_job_background, str(job.id), simulate_failure)
+
     return job
+
+
+def run_etl_job_background(job_id: str, simulate_failure: bool) -> None:
+    from app.tasks.celery_app import run_etl_job
+
+    run_etl_job(job_id, simulate_failure=simulate_failure)
 
 
 @router.get("/jobs/{job_id}", response_model=JobDetailResponse)
