@@ -1,0 +1,88 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: cc
+      POSTGRES_PASSWORD: cc
+      POSTGRES_DB: content_creator
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cc -d content_creator"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://cc:cc@postgres:5432/content_creator
+      REDIS_URL: redis://redis:6379/0
+      STORAGE_PATH: /data/storage
+    volumes:
+      - ./backend:/app
+      - storage_data:/data/storage
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: celery -A app.tasks.celery_app worker --loglevel=info
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://cc:cc@postgres:5432/content_creator
+      REDIS_URL: redis://redis:6379/0
+      STORAGE_PATH: /data/storage
+    volumes:
+      - ./backend:/app
+      - storage_data:/data/storage
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  streamlit:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: streamlit run streamlit_app/app.py --server.port 8501 --server.address 0.0.0.0
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    environment:
+      API_BASE_URL: http://api:8000
+    volumes:
+      - ./backend:/app
+    depends_on:
+      - api
+
+volumes:
+  postgres_data:
+  storage_data:
