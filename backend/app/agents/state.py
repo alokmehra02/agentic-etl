@@ -20,5 +20,6 @@ class AgentETLState(TypedDict):
     max_retries: int
     last_error: str | None
     human_approval: bool | None
+    simulate_failure: bool
     logs: Annotated[list[str], operator.add]
     current_step: str

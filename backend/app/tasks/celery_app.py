@@ -38,12 +38,13 @@ def run_etl_job(job_id: str, simulate_failure: bool = False) -> dict:
         db.add(agent_run)
         db.commit()
 
-        source_type = "data_export" if job.source_path.endswith(".zip") else "sample_json"
+        source_path = job.source_path
+        source_type: str = "data_export" if source_path.endswith(".zip") else "sample_json"
 
     final_state = run_etl_pipeline(
         job_id=job_id,
-        source_path=job.source_path,
-        source_type=source_type,
+        source_path=source_path,
+        source_type=source_type,  # type: ignore[arg-type]
         thread_id=thread_id,
         simulate_failure=simulate_failure,
     )
@@ -75,11 +76,12 @@ def run_etl_job(job_id: str, simulate_failure: bool = False) -> dict:
             "logs": final_state.get("logs", []),
         }
         agent_run.current_step = final_state.get("current_step")
+        final_status = job.status.value
 
     return {
         "job_id": job_id,
         "thread_id": thread_id,
-        "status": job.status.value if job else "unknown",
+        "status": final_status,
         "bronze_count": final_state.get("bronze_count"),
         "silver_count": final_state.get("silver_count"),
         "gold_profile_id": final_state.get("gold_profile_id"),

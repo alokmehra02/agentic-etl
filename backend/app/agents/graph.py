@@ -89,11 +89,10 @@ def run_etl_pipeline(
         "max_retries": settings.max_executor_retries,
         "last_error": None,
         "human_approval": human_approval,
+        "simulate_failure": simulate_failure,
         "logs": [],
         "current_step": "pending",
     }
-    if simulate_failure:
-        initial_state["simulate_failure"] = True  # type: ignore[typeddict-unknown-key]
 
     app = build_etl_graph()
     return app.invoke(initial_state)
